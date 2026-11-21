@@ -21,6 +21,40 @@ const first = (re, text) => { const m = re.exec(text); return m ? plainText(m[1]
 const all = (re, text) => [...text.matchAll(re)].map((m) => m[1]);
 const TONES = new Set(["ok", "warn", "critical"]);
 
+const readCell = (attrs, cell) => {
+  const span = /<span\b[^>]*class="([^"]*)"/i.exec(cell)?.[1].split(/\s+/).find((c) => TONES.has(c));
+  const direct = span ? undefined : /class="([^"]*)"/i.exec(attrs)?.[1].split(/\s+/).find((c) => TONES.has(c));
+  const tone = span ?? direct;
+  return tone ? { text: plainText(cell), tone } : { text: plainText(cell) };
+};
+
+const readTables = (block) => {
+  const tables = [];
+  for (const table of all(/<table\b[^>]*>([\s\S]*?)<\/table>/gi, block)) {
+    const head = /<thead\b[^>]*>([\s\S]*?)<\/thead>/i.exec(table);
+    const rowsHtml = /<tbody\b[^>]*>([\s\S]*?)<\/tbody>/i.exec(table);
+    let columns = head ? all(/<th\b[^>]*>([\s\S]*?)<\/th>/gi, head[1]).map(plainText) : [];
+    let rowsSource = rowsHtml ? rowsHtml[1] : head ? table.replace(/<thead\b[\s\S]*?<\/thead>/gi, "") : table;
+    if (!head) {
+      const firstRow = /<tr\b[^>]*>([\s\S]*?)<\/tr>/i.exec(rowsSource);
+      if (firstRow && /<th\b/i.test(firstRow[1])) {
+        columns = all(/<th\b[^>]*>([\s\S]*?)<\/th>/gi, firstRow[1]).map(plainText);
+        rowsSource = rowsSource.replace(firstRow[0], "");
+      }
+    }
+    const rows = [];
+    for (const row of all(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi, rowsSource)) {
+      const cells = [...row.matchAll(/<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi)].map((m) => readCell(m[1], m[2]));
+      if (cells.length) rows.push(cells);
+    }
+    if (columns.length || rows.length) tables.push({ columns, rows });
+  }
+  return tables;
+};
+
+const readNotes = (block) =>
+  all(/<p\b[^>]*>([\s\S]*?)<\/p>/gi, block.replace(/<table\b[\s\S]*?<\/table>/gi, "")).map(plainText).filter(Boolean);
+
 /** null when the text holds no console section this reader understands. */
 export function extractConsole(html) {
   const start = html.search(/<body[\s>]/i);
@@ -29,23 +63,18 @@ export function extractConsole(html) {
   for (const block of all(/<section\b[^>]*>([\s\S]*?)<\/section>/gi, body)) {
     const heading = first(/<h2\b[^>]*>([\s\S]*?)<\/h2>/i, block);
     if (!heading) continue;
-    const tables = [];
-    for (const table of all(/<table\b[^>]*>([\s\S]*?)<\/table>/gi, block)) {
-      const head = /<thead\b[^>]*>([\s\S]*?)<\/thead>/i.exec(table);
-      const columns = head ? all(/<th\b[^>]*>([\s\S]*?)<\/th>/gi, head[1]).map(plainText) : [];
-      const rowsHtml = /<tbody\b[^>]*>([\s\S]*?)<\/tbody>/i.exec(table);
-      const rows = [];
-      for (const row of all(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi, rowsHtml ? rowsHtml[1] : "")) {
-        const cells = all(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi, row).map((cell) => {
-          const tone = /<span\b[^>]*class="([^"]*)"/i.exec(cell)?.[1].split(/\s+/).find((c) => TONES.has(c));
-          return tone ? { text: plainText(cell), tone } : { text: plainText(cell) };
-        });
-        if (cells.length) rows.push(cells);
-      }
-      if (columns.length || rows.length) tables.push({ columns, rows });
+    sections.push({ heading, notes: readNotes(block), tables: readTables(block) });
+  }
+  if (!sections.length) {
+    const heads = [...body.matchAll(/<h2\b[^>]*>([\s\S]*?)<\/h2>/gi)];
+    for (let i = 0; i < heads.length; i++) {
+      const heading = plainText(heads[i][1]);
+      if (!heading) continue;
+      const from = heads[i].index + heads[i][0].length;
+      const to = i + 1 < heads.length ? heads[i + 1].index : body.length;
+      const chunk = body.slice(from, to);
+      sections.push({ heading, notes: readNotes(chunk), tables: readTables(chunk) });
     }
-    const notes = all(/<p\b[^>]*>([\s\S]*?)<\/p>/gi, block.replace(/<table\b[\s\S]*?<\/table>/gi, "")).map(plainText).filter(Boolean);
-    sections.push({ heading, notes, tables });
   }
   if (!sections.length) return null;
   return {

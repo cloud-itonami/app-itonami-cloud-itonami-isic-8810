@@ -4,7 +4,7 @@
 // physics.edn, docs/samples/operator-console.html) and pinned by digest in
 // release.json; the app carries no second, hand-written copy.
 import { mkdir, copyFile, readFile, writeFile, rm } from "node:fs/promises";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
@@ -16,9 +16,98 @@ import { extractConsole } from "./console.mjs";
 export const TAURI = "3.0.0-alpha.6";
 // The page talks to nothing but the Tauri IPC bridge. There is no external
 // operation, so no other origin appears here.
-export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'";
+const policy = (script, style) => `default-src 'none'; script-src ${script}; style-src ${style}; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'`;
+/** The trusted-page-v1 policy: same-document app, no inline script or style. */
+export const CSP = policy("'self'", "'self'");
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
+const HERE = fileURLToPath(new URL("../", import.meta.url));
+
+/**
+ * Client runtime profiles (kotoba.app.client-runtime.v1, KOTOBA-159, owner
+ * decision 2026-11-22). package.json `itonami.runtime` names one; a
+ * package.json without it predates the field and is read as trusted-page-v1.
+ * New repositories get restricted-wasm-v1 from scripts/scaffold.mjs.
+ * trusted-page-v1 builds only for an existing series app listed in
+ * scripts/trusted-page-v1-existing.txt, and only through TRUSTED_PAGE_V1_LAST_DAY.
+ */
+export const PROFILES = ["trusted-page-v1", "restricted-wasm-v1"];
+export const TRUSTED_PAGE_V1_LAST_DAY = "2027-03-31";
+export const TRUSTED_PAGE_V1_LIST = "scripts/trusted-page-v1-existing.txt";
+
+export function profileOf(meta) {
+  const profile = meta?.itonami?.runtime ?? "trusted-page-v1";
+  if (!PROFILES.includes(profile)) throw new Error(`package.json itonami.runtime is ${JSON.stringify(profile)}; use one of ${PROFILES.join(", ")}`);
+  return profile;
+}
+
+/** Throws unless `source` may build with `profile` on the UTC day of `now`. */
+export function checkProfile(profile, source, appRoot = HERE, now = new Date()) {
+  if (profile !== "trusted-page-v1") return;
+  const day = now.toISOString().slice(0, 10);
+  if (day > TRUSTED_PAGE_V1_LAST_DAY) {
+    throw new Error(`trusted-page-v1 was accepted through ${TRUSTED_PAGE_V1_LAST_DAY} (UTC); set package.json itonami.runtime to "restricted-wasm-v1"`);
+  }
+  const listed = readFileSync(resolve(appRoot, TRUSTED_PAGE_V1_LIST), "utf8").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+  if (!listed.includes(source)) {
+    throw new Error(`${source} is not an existing series app in ${TRUSTED_PAGE_V1_LIST}, so it cannot use trusted-page-v1; set package.json itonami.runtime to "restricted-wasm-v1"`);
+  }
+}
+
+const RESTRICTED_RUNTIME = "vendor/restricted-wasm-v1/kotoba-client-runtime.js";
+const VIEW_IMPORT = /^import \{[^}]*\} from "\.\/view\.js";\n/m;
+
+/**
+ * The guest's one inline script: view.js without its `export` keywords, then
+ * guest.js without its view.js import. Both are template files, so the text
+ * (and its CSP hash) is the same for every series app of one template revision.
+ */
+export function guestScript(appRoot = HERE) {
+  const view = readFileSync(resolve(appRoot, "src/view.js"), "utf8");
+  const guest = readFileSync(resolve(appRoot, "src/guest.js"), "utf8");
+  if (/^\s*import\b/m.test(view)) throw new Error("src/view.js must not import: it is inlined into the restricted guest");
+  if (!VIEW_IMPORT.test(guest)) throw new Error("src/guest.js must import from ./view.js on one line");
+  const script = view.replace(/^export /gm, "") + "\n" + guest.replace(VIEW_IMPORT, "");
+  if (/^\s*(import|export)\b/m.test(script)) throw new Error("the restricted guest script still has an import or export");
+  if (/<\/script/i.test(script)) throw new Error("the restricted guest script contains </script");
+  return script;
+}
+
+export function guestStyle(appRoot = HERE) {
+  const style = readFileSync(resolve(appRoot, "src/style.css"), "utf8");
+  if (/<\/style/i.test(style)) throw new Error("src/style.css contains </style");
+  return style;
+}
+
+/** The inline script mountRestrictedClientApp puts before the guest (R6). */
+export function guestPreamble(appRoot = HERE) {
+  const m = /^const GUEST_PREAMBLE = '<script>([^'\\]*)<\/script>';$/m.exec(readFileSync(resolve(appRoot, RESTRICTED_RUNTIME), "utf8"));
+  if (!m) throw new Error(`${RESTRICTED_RUNTIME} has no GUEST_PREAMBLE this build can hash`);
+  return m[1];
+}
+
+const cspHash = (text) => `'sha256-${createHash("sha256").update(text, "utf8").digest("base64")}'`;
+
+/**
+ * The page policy for a profile. restricted-wasm-v1: the sandboxed srcdoc
+ * guest inherits this policy, so it admits exactly the runtime's preamble and
+ * the guest's own inline script and style by hash, and nothing else inline.
+ */
+export function cspFor(profile, appRoot = HERE) {
+  if (profile === "trusted-page-v1") return CSP;
+  if (profile !== "restricted-wasm-v1") throw new Error(`unknown profile ${JSON.stringify(profile)}`);
+  return policy(`'self' ${cspHash(guestPreamble(appRoot))} ${cspHash(guestScript(appRoot))}`, `'self' ${cspHash(guestStyle(appRoot))}`);
+}
+
+const escapeHtml = (text) => text.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+/** Fill {{NAME}} placeholders in one pass; a placeholder without a value stops the build. */
+function fill(template, what, values) {
+  return template.replace(/\{\{([A-Z]+)\}\}/g, (_, key) => {
+    if (!Object.hasOwn(values, key)) throw new Error(`${what} has an unfilled placeholder {{${key}}}`);
+    return values[key];
+  });
+}
 
 const COMMIT = /^[0-9a-f]{40}$/;
 
@@ -58,7 +147,7 @@ export function sourceState(repo, env = process.env) {
   return { source_commit, dirty };
 }
 
-export async function build(appRoot = fileURLToPath(new URL("../", import.meta.url)), env = process.env) {
+export async function build(appRoot = HERE, env = process.env, { now = new Date() } = {}) {
   const repo = resolve(appRoot, "..");
   // Read before dist/ is written, so the build's own output never counts.
   const state = sourceState(repo, env);
@@ -66,8 +155,10 @@ export async function build(appRoot = fileURLToPath(new URL("../", import.meta.u
   const meta = JSON.parse(await readFile(resolve(appRoot, "package.json"), "utf8"));
 
   const pins = JSON.parse(await readFile(resolve(appRoot, "vendor/PINS.json"), "utf8"));
-  for (const [name, digest] of Object.entries(pins.files)) {
-    if (sha(await readFile(resolve(appRoot, "vendor", name))) !== digest) throw new Error(`canonical runtime pin drift: ${name}`);
+  for (const set of [pins.files, pins["restricted-wasm-v1"]?.files ?? {}]) {
+    for (const [name, digest] of Object.entries(set)) {
+      if (sha(await readFile(resolve(appRoot, "vendor", name))) !== digest) throw new Error(`canonical runtime pin drift: ${name}`);
+    }
   }
 
   const sources = {};
@@ -86,6 +177,8 @@ export async function build(appRoot = fileURLToPath(new URL("../", import.meta.u
     throw new Error("package.json has no itonami.source; re-run scripts/scaffold.mjs");
   }
   const identity = deriveIdentity(meta.itonami.source, blueprint);
+  const profile = profileOf(meta);
+  checkProfile(profile, identity.source, appRoot, now);
 
   // The stamped files must agree with the blueprint they were stamped from.
   const conf = JSON.parse(await readFile(resolve(appRoot, "src-tauri/tauri.conf.json"), "utf8"));
@@ -96,7 +189,8 @@ export async function build(appRoot = fileURLToPath(new URL("../", import.meta.u
   expect("tauri.conf.json productName", conf.productName, identity.productName);
   expect("tauri.conf.json window title", conf.app?.windows?.[0]?.title, identity.title);
   expect("tauri.conf.json version", conf.version, meta.version);
-  expect("tauri.conf.json csp", conf.app?.security?.csp, CSP);
+  const csp = cspFor(profile, appRoot);
+  expect("tauri.conf.json csp", conf.app?.security?.csp, csp);
 
   const physicsText = await source("physics.edn");
   let physics = null;
@@ -109,26 +203,48 @@ export async function build(appRoot = fileURLToPath(new URL("../", import.meta.u
   const operatorConsole = consoleText === null ? null : extractConsole(consoleText);
   if (consoleText !== null && operatorConsole === null) delete sources["docs/samples/operator-console.html"];
 
+  // trusted-page-v1 keeps the tab in localStorage. A restricted-wasm-v1 guest
+  // runs in an opaque origin, which has no localStorage, so its tab lives in memory.
+  const restricted = profile === "restricted-wasm-v1";
   const descriptor = {
-    schema: "kotoba.app.client-runtime.v1", target: "browser", profile: "trusted-page-v1", entry: "index.html",
-    "local-state": { adapter: "localstorage", schema: identity.stateSchema, version: 1 }, workers: [], operations: [],
+    schema: "kotoba.app.client-runtime.v1", target: "browser", profile, entry: "index.html",
+    "local-state": { adapter: restricted ? "memory" : "localstorage", schema: identity.stateSchema, version: 1 }, workers: [], operations: [],
   };
+  const data = { identity, version: meta.version, blueprint, physics, console: operatorConsole, sources, descriptor };
 
   await rm(out, { recursive: true, force: true });
   await mkdir(join(out, "vendor"), { recursive: true });
-  const index = (await readFile(resolve(appRoot, "src/index.html"), "utf8")).replaceAll("{{CSP}}", CSP).replaceAll("{{TITLE}}", identity.title.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])));
-  if (index.includes("{{")) throw new Error("index.html has an unfilled placeholder");
-  await writeFile(join(out, "index.html"), index);
-  for (const name of ["style.css", "app.js", "view.js"]) await copyFile(resolve(appRoot, "src", name), join(out, name));
-  await copyFile(resolve(appRoot, "vendor/kotoba-client-runtime.js"), join(out, "vendor/kotoba-client-runtime.js"));
-  const data = { identity, version: meta.version, blueprint, physics, console: operatorConsole, sources, descriptor };
-  await writeFile(join(out, "data.js"), `export default ${JSON.stringify(data, null, 1)};\n`);
+  const title = escapeHtml(identity.title);
+  let names;
+  let guest = null;
+  if (!restricted) {
+    const index = fill(await readFile(resolve(appRoot, "src/index.html"), "utf8"), "index.html", { CSP: csp, TITLE: title });
+    await writeFile(join(out, "index.html"), index);
+    for (const name of ["style.css", "app.js", "view.js"]) await copyFile(resolve(appRoot, "src", name), join(out, name));
+    await copyFile(resolve(appRoot, "vendor/kotoba-client-runtime.js"), join(out, "vendor/kotoba-client-runtime.js"));
+    await writeFile(join(out, "data.js"), `export default ${JSON.stringify(data, null, 1)};\n`);
+    names = ["index.html", "style.css", "app.js", "view.js", "data.js", "descriptor.json", "vendor/kotoba-client-runtime.js"];
+  } else {
+    // The guest artifact is pinned to the commit it is built from.
+    if (state.source_commit === null) throw new Error("restricted-wasm-v1 pins the guest to its source commit: build from a git checkout or set ITONAMI_SOURCE_COMMIT");
+    // `<` never appears raw in the JSON block, so no text in the data can close it.
+    const json = JSON.stringify(data).replace(/</g, "\\u003c");
+    const html = fill(await readFile(resolve(appRoot, "src/guest.html"), "utf8"), "guest.html", { TITLE: title, STYLE: guestStyle(appRoot), DATA: json, SCRIPT: guestScript(appRoot) });
+    const bytes = Buffer.from(html, "utf8");
+    if (html.length > 8388608) throw new Error("the restricted guest exceeds the 8 MiB mount budget");
+    guest = { revision: state.source_commit, sha256: sha(bytes), "max-bytes": bytes.length };
+    const index = fill(await readFile(resolve(appRoot, "src/host.html"), "utf8"), "host.html", { CSP: csp, TITLE: title });
+    await writeFile(join(out, "index.html"), index);
+    for (const name of ["host.css", "host.js", "view.js"]) await copyFile(resolve(appRoot, "src", name), join(out, name));
+    for (const name of ["kotoba-client-runtime.js", "kotoba-client-consent.css"]) await copyFile(resolve(appRoot, "vendor/restricted-wasm-v1", name), join(out, "vendor", name));
+    await writeFile(join(out, "host-data.js"), `export default ${JSON.stringify({ descriptor, artifact: guest, guest: html }, null, 1)};\n`);
+    names = ["index.html", "host.css", "host.js", "view.js", "host-data.js", "descriptor.json", "vendor/kotoba-client-runtime.js", "vendor/kotoba-client-consent.css"];
+  }
   await writeFile(join(out, "descriptor.json"), JSON.stringify(descriptor, null, 2) + "\n");
 
-  const names = ["index.html", "style.css", "app.js", "view.js", "data.js", "descriptor.json", "vendor/kotoba-client-runtime.js"];
   const files = {};
   for (const name of names) files[name] = sha(await readFile(join(out, name)));
-  const release = { schema: "awai.app.artifact.v1", id: identity.id, source: identity.source, version: meta.version, tauri: TAURI, runtimePins: pins, sources, files, source_commit: state.source_commit, dirty: state.dirty };
+  const release = { schema: "awai.app.artifact.v1", id: identity.id, source: identity.source, version: meta.version, tauri: TAURI, profile, runtimePins: restricted ? pins["restricted-wasm-v1"] : { source: pins.source, revision: pins.revision, files: pins.files }, sources, files, ...(guest ? { guest } : {}), source_commit: state.source_commit, dirty: state.dirty };
   await writeFile(join(out, "release.json"), JSON.stringify(release, null, 2) + "\n");
   return { identity, release, data };
 }

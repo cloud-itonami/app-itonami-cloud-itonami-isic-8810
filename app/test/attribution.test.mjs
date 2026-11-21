@@ -62,7 +62,7 @@ test("the about view carries both attribution sentences with this repository's c
 });
 
 test("the attribution follows the code it is given, not a literal", () => {
-  const identity = { scheme: "isco", code: "9999", classification: "ISCO-08 9999" };
+  const identity = { scheme: "isco", code: "9999", classification: "ISCO-08 unit group 9999" };
   assert.deepEqual(attributionFor(identity), { ja: ja("9999"), en: en("9999") });
   const tree = panelTree({
     identity: { ...identity, id: "network.itonami.isco9999", stateSchema: "itonami.series.isco9999.v1", source: "cloud-itonami-isco-9999", title: "Fixture" },
@@ -78,7 +78,7 @@ test("other schemes and the overview carry no ILO attribution", () => {
   assert.equal(attributionFor({ scheme: "isco", code: "" }), null);
   assert.equal(attributionFor(null), null);
   const data = {
-    identity: { scheme: "isic", code: "0111", classification: "ISIC Rev.4 0111", id: "x", stateSchema: "s", source: "cloud-itonami-isic-0111", title: "T" },
+    identity: { scheme: "isic", code: "0111", classification: "ISIC Rev.5 class 0111", id: "x", stateSchema: "s", source: "cloud-itonami-isic-0111", title: "T" },
     version: "0.1.0", blueprint: {}, physics: null, console: null, sources: {}, descriptor: { operations: [] },
   };
   assert.ok(!texts(panelTree(data, TAB_ABOUT)).some((t) => t.includes("ILO")));

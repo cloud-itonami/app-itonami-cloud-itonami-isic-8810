@@ -8,11 +8,33 @@
 import { readAll } from "./edn.mjs";
 
 export const SCHEMES = {
-  isic: { label: "ISIC Rev.4", colour: "#1F4E79" },
+  isic: { label: "ISIC", colour: "#1F4E79" },
   isco: { label: "ISCO-08", colour: "#2E6B4F" },
   jsic: { label: "JSIC", colour: "#7A3B1E" },
   cofog: { label: "COFOG", colour: "#5B3A7A" },
   unspsc: { label: "UNSPSC", colour: "#3D4A57" },
+};
+
+// The blueprint keys that name the classification, as the merged series
+// blueprints spell them, each with its scheme and edition. A blueprint holds
+// exactly one of them; the edition shown in the app comes from that key.
+export const CLASSIFICATION_KEYS = {
+  "itonami.blueprint/isic-rev4": { scheme: "isic", edition: "ISIC Rev.4" },
+  "itonami.blueprint/isic-rev5": { scheme: "isic", edition: "ISIC Rev.5" },
+  "itonami.blueprint/isco-08": { scheme: "isco", edition: "ISCO-08" },
+  "itonami.blueprint/jsic-code": { scheme: "jsic", edition: "JSIC" },
+  "itonami.blueprint/cofog": { scheme: "cofog", edition: "COFOG" },
+  "itonami.blueprint/unspsc-segment": { scheme: "unspsc", edition: "UNSPSC", levels: ["segment"] },
+};
+
+// The level of a code follows from its shape, per scheme. A code of any
+// other shape fails closed.
+const LEVELS = {
+  isic: [[/^[A-U]$/, "section"], [/^[0-9]{2}$/, "division"], [/^[0-9]{3}$/, "group"], [/^[0-9]{4}$/, "class"]],
+  isco: [[/^[0-9]$/, "major group"], [/^[0-9]{2}$/, "sub-major group"], [/^[0-9]{3}$/, "minor group"], [/^[0-9]{4}$/, "unit group"]],
+  jsic: [[/^[A-T]$/, "division"], [/^[0-9]{2}$/, "major group"], [/^[0-9]{3}$/, "group"], [/^[0-9]{4}$/, "industry"]],
+  cofog: [[/^[0-9]{2}$/, "division"], [/^[0-9]{2}\.[0-9]$/, "group"], [/^[0-9]{2}\.[0-9]\.[0-9]$/, "class"]],
+  unspsc: [[/^[0-9]{2}$/, "segment"], [/^[0-9]{4}$/, "family"], [/^[0-9]{6}$/, "class"], [/^[0-9]{8}$/, "commodity"]],
 };
 
 const APP_PREFIX = "app-itonami-";
@@ -61,7 +83,13 @@ export function parseSource(source) {
  * with a digit, so "isco-2423" becomes "isco2423" and "cofog-03.2" "cofog032".
  * The classification stays "<label> <code>" (the suffix is not part of it),
  * the icon keeps drawing the bare code, and the suffix is exposed as
- * `variant` (or null when the name has none). The window title and the
+ * `variant` (or null when the name has none). The classification is read
+ * from the blueprint's one classification key (CLASSIFICATION_KEYS): its
+ * value must be a string equal to the code in the repository name, the key
+ * gives the edition and the code's shape the level, so the label reads
+ * "<edition> <level> <code>", for example "ISIC Rev.5 class 7830". No key,
+ * more than one, another scheme's key, a different code or a code of an
+ * unknown shape fail closed. The package id never depends on it. The window title and the
  * page show `title`, the blueprint name verbatim (trimmed); `productName`
  * is the Tauri-safe form with each of `\ / : * ? " < > |` replaced by a
  * space and whitespace runs collapsed to one space, trimmed. Control
@@ -83,6 +111,7 @@ export function deriveIdentity(source, blueprint) {
   if (/[\u0000-\u001f]/.test(title)) throw new Error(`blueprint name is not usable as a product name: ${JSON.stringify(name)}`);
   const productName = title.replace(/[\\/:*?"<>|]/g, " ").replace(/\s+/g, " ").trim();
   if (!productName) throw new Error(`blueprint name is not usable as a product name: ${JSON.stringify(name)}`);
+  const classification = readClassification(blueprint, scheme, code);
   return {
     source: canonical,
     scheme,
@@ -92,7 +121,9 @@ export function deriveIdentity(source, blueprint) {
     id: `network.itonami.${slug}`,
     title,
     productName,
-    classification: `${SCHEMES[scheme].label} ${code}`,
+    edition: classification.edition,
+    level: classification.level,
+    classification: `${classification.edition} ${classification.level} ${code}`,
     stateSchema: `itonami.series.${slug}.v1`,
   };
 }
@@ -100,4 +131,21 @@ export function deriveIdentity(source, blueprint) {
 /** The source with its "<scheme>-" part removed (the scheme-less blueprint form). */
 function shortId(canonical, scheme) {
   return `${SERIES_PREFIX}${canonical.slice(SERIES_PREFIX.length).replace(`${scheme}-`, "")}`;
+}
+
+/** Edition and level of the blueprint's one classification key, checked against the repository code. */
+export function readClassification(blueprint, scheme, code) {
+  const keys = Object.keys(CLASSIFICATION_KEYS).filter((k) => blueprint && k in blueprint);
+  const accepted = Object.keys(CLASSIFICATION_KEYS).map((k) => `:${k}`).join(", ");
+  if (keys.length === 0) throw new Error(`blueprint has no classification key (accepted: ${accepted})`);
+  if (keys.length > 1) throw new Error(`blueprint has more than one classification key: ${keys.map((k) => `:${k}`).join(", ")}`);
+  const key = keys[0];
+  const { scheme: keyScheme, edition, levels } = CLASSIFICATION_KEYS[key];
+  if (keyScheme !== scheme) throw new Error(`classification key :${key} is for ${keyScheme}, but the repository is ${scheme}`);
+  const value = blueprint[key];
+  if (typeof value !== "string") throw new Error(`classification :${key} must be a string, got ${JSON.stringify(value)}`);
+  if (value !== code) throw new Error(`classification :${key} ${JSON.stringify(value)} does not match the repository code ${JSON.stringify(code)}`);
+  const level = LEVELS[scheme].find(([shape]) => shape.test(code))?.[1];
+  if (!level || (levels && !levels.includes(level))) throw new Error(`classification :${key} ${JSON.stringify(code)} has no known ${edition} level`);
+  return { key, edition, level };
 }

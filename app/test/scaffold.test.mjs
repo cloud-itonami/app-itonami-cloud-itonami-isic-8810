@@ -4,30 +4,34 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { CSP } from "../scripts/build.mjs";
+import { cspFor } from "../scripts/build.mjs";
 import { ICON_FILES, TEMPLATE_FILES, repoNameFromRemote, scaffold } from "../scripts/scaffold.mjs";
 
 const APP = fileURLToPath(new URL("../", import.meta.url));
 
 const BLUEPRINT_COFOG = `[{:itonami.blueprint/id "cloud-itonami-cofog-03.2"
-  :itonami.blueprint/name "Household Consumption"}]
+  :itonami.blueprint/name "Household Consumption"
+  :itonami.blueprint/cofog "03.2"}]
 `;
 
 const BLUEPRINT_SCHEME_MISSING = `[{:itonami.blueprint/id "cloud-itonami-7810"
-  :itonami.blueprint/name "Growing of Vegetables"}]
+  :itonami.blueprint/name "Growing of Vegetables"
+  :itonami.blueprint/isic-rev4 "7810"}]
 `;
 
 const BLUEPRINT_SUFFIXED = `[{:itonami.blueprint/id "cloud-itonami-8129-facade"
-  :itonami.blueprint/name "Facade Work"}]
+  :itonami.blueprint/name "Facade Work"
+  :itonami.blueprint/isic-rev5 "8129"}]
 `;
 
 const BLUEPRINT_ISCO = `[{:itonami.blueprint/id "cloud-itonami-isco-2423"
-  :itonami.blueprint/name "Community Careers Practice"}]
+  :itonami.blueprint/name "Community Careers Practice"
+  :itonami.blueprint/isco-08 "2423"}]
 `;
 
 async function stamped(blueprint) {
@@ -49,6 +53,7 @@ test("scaffold writes identity files for a dotted cofog code", async (t) => {
     id: "network.itonami.cofog032",
     title: "Household Consumption",
     source: "cloud-itonami-cofog-03.2",
+    runtime: "restricted-wasm-v1",
   });
   assert.deepEqual(
     Object.keys(pkg.scripts).sort(),
@@ -63,7 +68,7 @@ test("scaffold writes identity files for a dotted cofog code", async (t) => {
   assert.equal(conf.app.windows[0].title, "Household Consumption");
   assert.equal(conf.build.frontendDist, "../dist");
   assert.equal(conf.app.withGlobalTauri, true);
-  assert.equal(conf.app.security.csp, CSP);
+  assert.equal(conf.app.security.csp, cspFor("restricted-wasm-v1", join(repo, "app")));
   assert.equal(conf.bundle.active, false);
   assert.equal(conf.bundle.icon.length, 5);
 
@@ -93,7 +98,7 @@ test("scaffold stamps a scheme-missing blueprint from --repo", async (t) => {
   assert.equal(identity.variant, null);
   assert.equal(identity.slug, "isic7810");
   assert.equal(identity.id, "network.itonami.isic7810");
-  assert.equal(identity.classification, "ISIC Rev.4 7810");
+  assert.equal(identity.classification, "ISIC Rev.4 class 7810");
 
   const pkg = JSON.parse(await readFile(join(repo, "app/package.json"), "utf8"));
   assert.equal(pkg.name, "@itonami/isic7810");
@@ -101,6 +106,7 @@ test("scaffold stamps a scheme-missing blueprint from --repo", async (t) => {
     id: "network.itonami.isic7810",
     title: "Growing of Vegetables",
     source: "cloud-itonami-isic-7810",
+    runtime: "restricted-wasm-v1",
   });
 });
 
@@ -114,7 +120,7 @@ test("scaffold stamps a suffixed blueprint from --repo", async (t) => {
   assert.equal(identity.variant, "facade");
   assert.equal(identity.slug, "isic8129facade");
   assert.equal(identity.id, "network.itonami.isic8129facade");
-  assert.equal(identity.classification, "ISIC Rev.4 8129");
+  assert.equal(identity.classification, "ISIC Rev.5 class 8129");
 
   const pkg = JSON.parse(await readFile(join(repo, "app/package.json"), "utf8"));
   assert.equal(pkg.name, "@itonami/isic8129facade");
@@ -123,7 +129,8 @@ test("scaffold stamps a suffixed blueprint from --repo", async (t) => {
 
 test("scaffold writes a sanitized productName and the verbatim window title", async (t) => {
   const repo = await stamped(`[{:itonami.blueprint/id "cloud-itonami-isco-2423"
-  :itonami.blueprint/name "Research Support: Biology"}]
+  :itonami.blueprint/name "Research Support: Biology"
+  :itonami.blueprint/isco-08 "2423"}]
 `);
   t.after(() => rm(repo, { recursive: true, force: true }));
   const { identity } = await scaffold(repo, { icons: false, repo: "cloud-itonami-isco-2423" });
@@ -189,4 +196,19 @@ test("scaffold keeps an existing workflow and a set version", async (t) => {
   assert.equal(pkg.version, "0.2.0");
   const conf = JSON.parse(await readFile(join(repo, "app/src-tauri/tauri.conf.json"), "utf8"));
   assert.equal(conf.version, "0.2.0");
+});
+
+test("scaffold makes no directory for a top-level template file", async (t) => {
+  const repo = await stamped(BLUEPRINT_ISCO);
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await scaffold(repo, { icons: false, repo: "cloud-itonami-isco-2423" });
+  // A top-level file such as README.md once made an empty app/README.m/ directory.
+  const expected = new Set(TEMPLATE_FILES.map((name) => name.split("/")[0]));
+  for (const extra of ["package.json", "icon", "src-tauri"]) expected.add(extra);
+  for (const entry of readdirSync(join(repo, "app"), { withFileTypes: true })) {
+    assert.ok(expected.has(entry.name), `unexpected app/${entry.name}${entry.isDirectory() ? "/" : ""}`);
+  }
+  for (const name of TEMPLATE_FILES.filter((n) => !n.includes("/"))) {
+    assert.ok(!existsSync(join(repo, "app", name.slice(0, -1))), `no app/${name.slice(0, -1)}/`);
+  }
 });

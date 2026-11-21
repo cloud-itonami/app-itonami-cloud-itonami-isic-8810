@@ -6,6 +6,11 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 : "${ANDROID_HOME:=$HOME/Library/Android/sdk}"
 if [ -z "${NDK_HOME:-}" ]; then NDK_HOME=$(ls -d "$ANDROID_HOME"/ndk/* | sort | tail -1); fi
 export ANDROID_HOME NDK_HOME
+build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
+aapt2="$build_tools/aapt2"
+if [ ! -x "$aapt2" ]; then
+  echo "no aapt2 under $ANDROID_HOME/build-tools; it checks the built APK's permissions" >&2; exit 1
+fi
 for tool in cargo rustc; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "$tool is not on PATH; install a Rust toolchain (rustup) and put its cargo/rustc on PATH" >&2; exit 1
@@ -34,9 +39,9 @@ activity="$gen/java/$(printf '%s' "$pkg" | tr . /)/MainActivity.kt"
 if [ ! -f "$activity" ]; then
   echo "tauri android init wrote no $activity" >&2; exit 1
 fi
-if ! grep -o 'android:configChanges="[^"]*"' "$gen/AndroidManifest.xml" | grep -q 'uiMode'; then
-  echo "AndroidManifest.xml configChanges has no uiMode; MainActivity.onConfigurationChanged would not see a theme switch" >&2; exit 1
-fi
+# uiMode must be in configChanges, and INTERNET is removed (the app makes no
+# network request): see scripts/android-manifest.mjs.
+node "$root/scripts/android-manifest.mjs" "$gen/AndroidManifest.xml"
 if [ "$(grep -c '^package __PACKAGE__$' "$root/android/MainActivity.kt")" != 1 ]; then
   echo "android/MainActivity.kt has no single 'package __PACKAGE__' line" >&2; exit 1
 fi
@@ -46,4 +51,9 @@ rm -rf "$root/src-tauri/gen/android/app/build/outputs/apk" "$root/src-tauri/gen/
 npm run tauri -- android build --debug --apk --target aarch64 --ci
 apk="$root/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
 test -f "$apk"
+# The merged manifest in the APK must not ask for INTERNET.
+perms=$("$aapt2" dump permissions "$apk")
+if printf '%s\n' "$perms" | grep -q 'android\.permission\.INTERNET'; then
+  echo "the APK still asks for android.permission.INTERNET:" >&2; printf '%s\n' "$perms" >&2; exit 1
+fi
 shasum -a 256 "$apk"

@@ -25,7 +25,7 @@ const data = (over = {}) => ({
     slug: "isco2423",
     id: "network.itonami.isco2423",
     title: "Fixture Practice",
-    classification: "ISCO-08 2423",
+    classification: "ISCO-08 unit group 2423",
     stateSchema: "itonami.series.isco2423.v1",
   },
   version: "0.1.0",

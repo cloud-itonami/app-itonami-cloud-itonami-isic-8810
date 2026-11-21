@@ -99,6 +99,33 @@ function physicsTree(data) {
   return node("div", {}, parts);
 }
 
+/**
+ * The attribution lines for the classification the app references, derived
+ * from identity.scheme and identity.code (the repository name), so this file
+ * stays the same in every series repository. ISCO-08 is ILO copyright: the
+ * app may cite the code only with the source and a non-endorsement notice
+ * (AWAI-3629). Never add the ILO logo or ILO imagery. Schemes without a
+ * required attribution return null.
+ */
+export function attributionFor(identity) {
+  if (!identity || identity.scheme !== "isco" || typeof identity.code !== "string" || !identity.code) return null;
+  const code = identity.code;
+  return {
+    ja: `職業の参照: ISCO-08（国際労働機関 ILO、2012 年）のコード ${code}。日本語の名称は当方の訳です。この app は ILO が作成・確認・推奨したものではありません。`,
+    en: `Occupation reference: ISCO-08 (International Labour Organization, 2012), code ${code}. This app is not produced, reviewed or endorsed by the ILO.`,
+  };
+}
+
+function attributionNodes(identity) {
+  const lines = attributionFor(identity);
+  if (!lines) return [];
+  return [node("section", { class: "attribution" }, [
+    node("h3", {}, [text("出典 / Attribution")]),
+    node("p", { lang: "ja" }, [text(lines.ja)]),
+    node("p", { lang: "en" }, [text(lines.en)]),
+  ])];
+}
+
 function aboutTree(data) {
   const identity = data.identity;
   const digests = Object.entries(data.sources).map(([path, digest]) =>
@@ -114,6 +141,7 @@ function aboutTree(data) {
       node("dt", {}, [text("外部通信")]),
       node("dd", {}, [text("なし。この app は外部へ通信しません。操作の宣言 (operations) はありません。")]),
     ]),
+    ...attributionNodes(identity),
     node("h3", {}, [text("ソースダイジェスト")]),
     node("ul", {}, digests),
   ]);

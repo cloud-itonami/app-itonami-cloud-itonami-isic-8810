@@ -4,7 +4,8 @@
 // physics.edn, docs/samples/operator-console.html) and pinned by digest in
 // release.json; the app carries no second, hand-written copy.
 import { mkdir, copyFile, readFile, writeFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve, join } from "node:path";
 import { createHash } from "node:crypto";
@@ -19,8 +20,48 @@ export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img
 
 const sha = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
-export async function build(appRoot = fileURLToPath(new URL("../", import.meta.url))) {
+const COMMIT = /^[0-9a-f]{40}$/;
+
+/**
+ * The commit the build is made from, for release.json: `source_commit` is the
+ * 40-hex `git rev-parse HEAD` of the repository root, and `dirty` is true when
+ * `git status --porcelain` lists a tracked change or an untracked file that is
+ * not ignored. The repository root must be the top of its own git checkout; a
+ * tarball unpacked inside some other checkout does not take that one's commit.
+ * Without git, ITONAMI_SOURCE_COMMIT (40 hex) and ITONAMI_SOURCE_DIRTY
+ * ("true" or "false") give the values when they are set; otherwise both are
+ * null. Nothing is guessed: a malformed variable stops the build.
+ */
+export function sourceState(repo, env = process.env) {
+  const git = (args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  let top = null;
+  try {
+    top = git(["rev-parse", "--show-toplevel"]).trim();
+  } catch {
+    // Not a git checkout, or no git on this machine.
+  }
+  if (top !== null && realpathSync(top) === realpathSync(repo)) {
+    const commit = git(["rev-parse", "HEAD"]).trim();
+    if (!COMMIT.test(commit)) throw new Error(`git rev-parse HEAD gave ${JSON.stringify(commit)}, not a 40-hex commit`);
+    return { source_commit: commit, dirty: git(["status", "--porcelain"]).trim() !== "" };
+  }
+  let source_commit = null;
+  let dirty = null;
+  if (env.ITONAMI_SOURCE_COMMIT !== undefined) {
+    if (!COMMIT.test(env.ITONAMI_SOURCE_COMMIT)) throw new Error("ITONAMI_SOURCE_COMMIT is not a 40-hex commit");
+    source_commit = env.ITONAMI_SOURCE_COMMIT;
+  }
+  if (env.ITONAMI_SOURCE_DIRTY !== undefined) {
+    if (env.ITONAMI_SOURCE_DIRTY !== "true" && env.ITONAMI_SOURCE_DIRTY !== "false") throw new Error('ITONAMI_SOURCE_DIRTY is not "true" or "false"');
+    dirty = env.ITONAMI_SOURCE_DIRTY === "true";
+  }
+  return { source_commit, dirty };
+}
+
+export async function build(appRoot = fileURLToPath(new URL("../", import.meta.url)), env = process.env) {
   const repo = resolve(appRoot, "..");
+  // Read before dist/ is written, so the build's own output never counts.
+  const state = sourceState(repo, env);
   const out = resolve(appRoot, "dist");
   const meta = JSON.parse(await readFile(resolve(appRoot, "package.json"), "utf8"));
 
@@ -87,7 +128,7 @@ export async function build(appRoot = fileURLToPath(new URL("../", import.meta.u
   const names = ["index.html", "style.css", "app.js", "view.js", "data.js", "descriptor.json", "vendor/kotoba-client-runtime.js"];
   const files = {};
   for (const name of names) files[name] = sha(await readFile(join(out, name)));
-  const release = { schema: "awai.app.artifact.v1", id: identity.id, source: identity.source, version: meta.version, tauri: TAURI, runtimePins: pins, sources, files };
+  const release = { schema: "awai.app.artifact.v1", id: identity.id, source: identity.source, version: meta.version, tauri: TAURI, runtimePins: pins, sources, files, source_commit: state.source_commit, dirty: state.dirty };
   await writeFile(join(out, "release.json"), JSON.stringify(release, null, 2) + "\n");
   return { identity, release, data };
 }
